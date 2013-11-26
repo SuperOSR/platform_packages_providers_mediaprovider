@@ -1991,38 +1991,7 @@ public class MediaProvider extends ContentProvider {
         // Note: the BUCKET_ID and BUCKET_DISPLAY_NAME attributes are spelled the
         // same for both images and video. However, for backwards-compatibility reasons
         // there is no common base class. We use the ImageColumns version here
-        int finalhash = path.hashCode();
-		//if((finalhash == 793037046)||(finalhash == -1306279059))
-		if(finalhash == 793037046)
-		{
-			finalhash = 1506676782;
-		}
-		else if(finalhash == 1841554559)   //0
-		{
-			finalhash = -1739773001;
-		}
-		else if(finalhash == 1980483588)   //10
-		{
-			finalhash = -1600843972;
-		}
-		else if(finalhash == 1687080581)   //11
-		{
-			finalhash = -1894246979;
-		}
-		else if(finalhash == 1393677574)   //12
-		{
-			finalhash = 2107317310;
-		}
-		else if(finalhash == 1100274567)   //13
-		{
-			finalhash = 1813914303;
-		}
-		else if(finalhash == 806871560)   //14
-		{
-			finalhash = 1520511296;
-		}
-
-        values.put(ImageColumns.BUCKET_ID, finalhash);
+        values.put(ImageColumns.BUCKET_ID, path.hashCode());
         values.put(ImageColumns.BUCKET_DISPLAY_NAME, name);
     }
 
