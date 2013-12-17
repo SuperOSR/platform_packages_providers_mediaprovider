@@ -60,7 +60,6 @@ import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.FileUtils;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Message;
@@ -127,15 +126,20 @@ public class MediaProvider extends ContentProvider {
     private static final String sExternalPath;
     /** Resolved canonical path to cache storage. */
     private static final String sCachePath;
+    /** Resolved canonical path to legacy storage. */
+    private static final String sLegacyPath;
 
     static {
         try {
             sExternalPath = Environment.getExternalStorageDirectory().getCanonicalPath();
             sCachePath = Environment.getDownloadCacheDirectory().getCanonicalPath();
+            sLegacyPath = Environment.getLegacyExternalStorageDirectory().getCanonicalPath();
         } catch (IOException e) {
             throw new RuntimeException("Unable to resolve canonical paths", e);
         }
     }
+
+    private StorageManager mStorageManager;
 
     // In memory cache of path<->id mappings, to speed up inserts during media scan
     HashMap<String, Long> mDirectoryCache = new HashMap<String, Long>();
@@ -247,53 +251,50 @@ public class MediaProvider extends ContentProvider {
                 } else {
                     // If secondary external storage is ejected, then we delete all database
                     // entries for that storage from the files table.
-                    DatabaseHelper database;
                     synchronized (mDatabases) {
-                        // This synchronized block is limited to avoid a potential deadlock
-                        // with bulkInsert() method.
-                        database = mDatabases.get(EXTERNAL_VOLUME);
-                    }
-                    Uri uri = Uri.parse("file://" + storage.getPath());
-                    if (database != null) {
-                        try {
-                            // Send media scanner started and stopped broadcasts for apps that rely
-                            // on these Intents for coarse grained media database notifications.
-                            context.sendBroadcast(
-                                    new Intent(Intent.ACTION_MEDIA_SCANNER_STARTED, uri));
+                        DatabaseHelper database = mDatabases.get(EXTERNAL_VOLUME);
+                        Uri uri = Uri.parse("file://" + storage.getPath());
+                        if (database != null) {
+                            try {
+                                // Send media scanner started and stopped broadcasts for apps that rely
+                                // on these Intents for coarse grained media database notifications.
+                                context.sendBroadcast(
+                                        new Intent(Intent.ACTION_MEDIA_SCANNER_STARTED, uri));
 
-                            // don't send objectRemoved events - MTP be sending StorageRemoved anyway
-                            mDisableMtpObjectCallbacks = true;
-                            Log.d(TAG, "deleting all entries for storage " + storage);
-                            SQLiteDatabase db = database.getWritableDatabase();
-                            // First clear the file path to disable the _DELETE_FILE database hook.
-                            // We do this to avoid deleting files if the volume is remounted while
-                            // we are still processing the unmount event.
-                            ContentValues values = new ContentValues();
-                            values.putNull(Files.FileColumns.DATA);
-                            String where = FileColumns.STORAGE_ID + "=?";
-                            String[] whereArgs = new String[] { Integer.toString(storage.getStorageId()) };
-                            database.mNumUpdates++;
-                            db.update("files", values, where, whereArgs);
-                            // now delete the records
-                            database.mNumDeletes++;
-                            int numpurged = db.delete("files", where, whereArgs);
-                            logToDb(db, "removed " + numpurged +
-                                    " rows for ejected filesystem " + storage.getPath());
-                            // notify on media Uris as well as the files Uri
-                            context.getContentResolver().notifyChange(
-                                    Audio.Media.getContentUri(EXTERNAL_VOLUME), null);
-                            context.getContentResolver().notifyChange(
-                                    Images.Media.getContentUri(EXTERNAL_VOLUME), null);
-                            context.getContentResolver().notifyChange(
-                                    Video.Media.getContentUri(EXTERNAL_VOLUME), null);
-                            context.getContentResolver().notifyChange(
-                                    Files.getContentUri(EXTERNAL_VOLUME), null);
-                        } catch (Exception e) {
-                            Log.e(TAG, "exception deleting storage entries", e);
-                        } finally {
-                            context.sendBroadcast(
-                                    new Intent(Intent.ACTION_MEDIA_SCANNER_FINISHED, uri));
-                            mDisableMtpObjectCallbacks = false;
+                                // don't send objectRemoved events - MTP be sending StorageRemoved anyway
+                                mDisableMtpObjectCallbacks = true;
+                                Log.d(TAG, "deleting all entries for storage " + storage);
+                                SQLiteDatabase db = database.getWritableDatabase();
+                                // First clear the file path to disable the _DELETE_FILE database hook.
+                                // We do this to avoid deleting files if the volume is remounted while
+                                // we are still processing the unmount event.
+                                ContentValues values = new ContentValues();
+                                values.putNull(Files.FileColumns.DATA);
+                                String where = FileColumns.STORAGE_ID + "=?";
+                                String[] whereArgs = new String[] { Integer.toString(storage.getStorageId()) };
+                                database.mNumUpdates++;
+                                db.update("files", values, where, whereArgs);
+                                // now delete the records
+                                database.mNumDeletes++;
+                                int numpurged = db.delete("files", where, whereArgs);
+                                logToDb(db, "removed " + numpurged +
+                                        " rows for ejected filesystem " + storage.getPath());
+                                // notify on media Uris as well as the files Uri
+                                context.getContentResolver().notifyChange(
+                                        Audio.Media.getContentUri(EXTERNAL_VOLUME), null);
+                                context.getContentResolver().notifyChange(
+                                        Images.Media.getContentUri(EXTERNAL_VOLUME), null);
+                                context.getContentResolver().notifyChange(
+                                        Video.Media.getContentUri(EXTERNAL_VOLUME), null);
+                                context.getContentResolver().notifyChange(
+                                        Files.getContentUri(EXTERNAL_VOLUME), null);
+                            } catch (Exception e) {
+                                Log.e(TAG, "exception deleting storage entries", e);
+                            } finally {
+                                context.sendBroadcast(
+                                        new Intent(Intent.ACTION_MEDIA_SCANNER_FINISHED, uri));
+                                mDisableMtpObjectCallbacks = false;
+                            }
                         }
                     }
                 }
@@ -549,6 +550,8 @@ public class MediaProvider extends ContentProvider {
     public boolean onCreate() {
         final Context context = getContext();
 
+        mStorageManager = (StorageManager) context.getSystemService(Context.STORAGE_SERVICE);
+
         sArtistAlbumsMap.put(MediaStore.Audio.Albums._ID, "audio.album_id AS " +
                 MediaStore.Audio.Albums._ID);
         sArtistAlbumsMap.put(MediaStore.Audio.Albums.ALBUM, "album");
@@ -602,17 +605,6 @@ public class MediaProvider extends ContentProvider {
                             File origFile = new File(mCurrentThumbRequest.mPath);
                             if (origFile.exists() && origFile.length() > 0) {
                                 mCurrentThumbRequest.execute();
-                                // Check if more requests for the same image are queued.
-                                synchronized (mMediaThumbQueue) {
-                                    for (MediaThumbRequest mtq : mMediaThumbQueue) {
-                                        if ((mtq.mOrigId == mCurrentThumbRequest.mOrigId) &&
-                                            (mtq.mIsVideo == mCurrentThumbRequest.mIsVideo) &&
-                                            (mtq.mMagic == 0) &&
-                                            (mtq.mState == MediaThumbRequest.State.WAIT)) {
-                                            mtq.mMagic = mCurrentThumbRequest.mMagic;
-                                        }
-                                    }
-                                }
                             } else {
                                 // original file hasn't been stored yet
                                 synchronized (mMediaThumbQueue) {
@@ -1992,35 +1984,20 @@ public class MediaProvider extends ContentProvider {
         // same for both images and video. However, for backwards-compatibility reasons
         // there is no common base class. We use the ImageColumns version here
         int finalhash = path.hashCode();
-		//if((finalhash == 793037046)||(finalhash == -1306279059))
-		if(finalhash == 793037046)
-		{
-			finalhash = 1506676782;
-		}
-		else if(finalhash == 1841554559)   //0
-		{
-			finalhash = -1739773001;
-		}
-		else if(finalhash == 1980483588)   //10
-		{
-			finalhash = -1600843972;
-		}
-		else if(finalhash == 1687080581)   //11
-		{
-			finalhash = -1894246979;
-		}
-		else if(finalhash == 1393677574)   //12
-		{
-			finalhash = 2107317310;
-		}
-		else if(finalhash == 1100274567)   //13
-		{
-			finalhash = 1813914303;
-		}
-		else if(finalhash == 806871560)   //14
-		{
-			finalhash = 1520511296;
-		}
+	if(finalhash == 793037046)
+		finalhash = 1506676782;
+	else if(finalhash == 1841554559)   //0
+		finalhash = -1739773001;
+	else if(finalhash == 1980483588)   //10
+		finalhash = -1600843972;
+	else if(finalhash == 1687080581)   //11
+		finalhash = -1894246979;
+	else if(finalhash == 1393677574)   //12
+		finalhash = 2107317310;
+	else if(finalhash == 1100274567)   //13
+		finalhash = 1813914303;
+	else if(finalhash == 806871560)   //14
+		finalhash = 1520511296;
 
         values.put(ImageColumns.BUCKET_ID, finalhash);
         values.put(ImageColumns.BUCKET_DISPLAY_NAME, name);
@@ -4210,8 +4187,11 @@ public class MediaProvider extends ContentProvider {
                                 sGetTableAndWhereParam.where, whereArgs);
                         if (count > 0) {
                             // update the paths of any files and folders contained in the directory
-                            Object[] bindArgs = new Object[] {newPath, oldPath.length() + 1,
-                                    oldPath + "/", oldPath + "0",
+                            Object[] bindArgs = new Object[] {
+                                    newPath,
+                                    oldPath.length() + 1,
+                                    oldPath + "/",
+                                    oldPath + "0",
                                     // update bucket_display_name and bucket_id based on new path
                                     f.getName(),
                                     f.toString().toLowerCase().hashCode()
@@ -4219,8 +4199,8 @@ public class MediaProvider extends ContentProvider {
                             helper.mNumUpdates++;
                             db.execSQL("UPDATE files SET _data=?1||SUBSTR(_data, ?2)" +
                                     // also update bucket_display_name
-                                    ",bucket_display_name=?6" +
-                                    ",bucket_id=?7" +
+                                    ",bucket_display_name=?5" +
+                                    ",bucket_id=?6" +
                                     " WHERE _data >= ?3 AND _data < ?4;",
                                     bindArgs);
                         }
@@ -4641,10 +4621,13 @@ public class MediaProvider extends ContentProvider {
             throw new IllegalArgumentException("Unable to resolve canonical path for " + file, e);
         }
 
-        if (path.startsWith(sExternalPath)) {
-            Context c = getContext();
-            if (c.checkCallingOrSelfUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    != PackageManager.PERMISSION_GRANTED) {
+        Context c = getContext();
+        boolean readGranted =
+                (c.checkCallingOrSelfUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                == PackageManager.PERMISSION_GRANTED);
+
+        if (path.startsWith(sExternalPath) || path.startsWith(sLegacyPath)) {
+            if (!readGranted) {
                 c.enforceCallingOrSelfPermission(
                         READ_EXTERNAL_STORAGE, "External path: " + path);
             }
@@ -4658,15 +4641,19 @@ public class MediaProvider extends ContentProvider {
             }
 
         } else if (path.startsWith(sCachePath)) {
-            getContext().enforceCallingOrSelfPermission(
-                    ACCESS_CACHE_FILESYSTEM, "Cache path: " + path);
+            if (!readGranted) {
+                c.enforceCallingOrSelfPermission(
+                        ACCESS_CACHE_FILESYSTEM, "Cache path: " + path);
+            }
         } else if (isWrite) {
             // don't write to non-cache, non-sdcard files.
             throw new FileNotFoundException("Can't access " + file);
         } else if (isSecondaryExternalPath(path)) {
             // read access is OK with the appropriate permission
-            getContext().enforceCallingOrSelfPermission(
-                    READ_EXTERNAL_STORAGE, "External path: " + path);
+            if (!readGranted) {
+                c.enforceCallingOrSelfPermission(
+                        READ_EXTERNAL_STORAGE, "External path: " + path);
+            }
         } else {
             checkWorldReadAccess(path);
         }
@@ -5270,16 +5257,15 @@ public class MediaProvider extends ContentProvider {
                         false, mObjectRemovedCallback);
             } else if (EXTERNAL_VOLUME.equals(volume)) {
                 if (Environment.isExternalStorageRemovable()) {
-                    String path = mExternalStoragePaths[0];
-                    int volumeID = FileUtils.getFatVolumeId(path);
-                    if (LOCAL_LOGV) Log.v(TAG, path + " volume ID: " + volumeID);
+                    final StorageVolume actualVolume = mStorageManager.getPrimaryVolume();
+                    final int volumeId = actualVolume.getFatVolumeId();
 
                     // Must check for failure!
                     // If the volume is not (yet) mounted, this will create a new
                     // external-ffffffff.db database instead of the one we expect.  Then, if
                     // android.process.media is later killed and respawned, the real external
                     // database will be attached, containing stale records, or worse, be empty.
-                    if (volumeID == -1) {
+                    if (volumeId == -1) {
                         String state = Environment.getExternalStorageState();
                         if (Environment.MEDIA_MOUNTED.equals(state) ||
                                 Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
@@ -5298,10 +5284,10 @@ public class MediaProvider extends ContentProvider {
                     }
 
                     // generate database name based on volume ID
-                    String dbName = "external-" + Integer.toHexString(volumeID) + ".db";
+                    String dbName = "external-" + Integer.toHexString(volumeId) + ".db";
                     helper = new DatabaseHelper(context, dbName, false,
                             false, mObjectRemovedCallback);
-                    mVolumeId = volumeID;
+                    mVolumeId = volumeId;
                 } else {
                     // external database name should be EXTERNAL_DATABASE_NAME
                     // however earlier releases used the external-XXXXXXXX.db naming
